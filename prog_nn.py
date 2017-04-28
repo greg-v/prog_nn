@@ -6,16 +6,30 @@ import numpy as np
 from pprint import pprint
 from param_collection import ParamCollection
 
-# Helper functions.
-def weight_variable(shape, stddev=0.1, initial=None):
-    if initial is None:
-        initial = tf.truncated_normal(shape, stddev=stddev, dtype=tf.float64)
-    return tf.Variable(initial)
+import os
 
-def bias_variable(shape, init_bias=0.1, initial=None):
+# Helper functions.
+def weight_variable(shape, name, stddev=0.1, initial=None):
     if initial is None:
-        initial = tf.constant(init_bias, shape=shape, dtype=tf.float64)
-    return tf.Variable(initial)
+        initial = tf.truncated_normal(shape, stddev=stddev, dtype=tf.float32)
+    return tf.Variable(initial, name=name)
+
+def bias_variable(shape, name, init_bias=0.1, initial=None):
+    if initial is None:
+        initial = tf.constant(init_bias, shape=shape, dtype=tf.float32)
+    return tf.Variable(initial, name=name)
+
+def get_checkpoint_path(base_path, column_i, checkpoint_i):
+    print("base path is:", base_path)
+    # Create file path here if non-existant?
+    file_path = base_path+"/col"+str(column_i)+"/checkpoint"+str(checkpoint_i)+".npy"
+    print("file path is: ", file_path)
+    # Verify path exists
+    directory = os.path.dirname(file_path)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+    return file_path
 
 class InitialColumnProgNN(object):
     """
@@ -30,14 +44,15 @@ class InitialColumnProgNN(object):
         None - attaches objects to class for InitialColumnProgNN.session.run()
     """
 
-    def __init__(self, topology, activations, session, dtype=tf.float64):
+    def __init__(self, topology, activations, session, checkpoint_base_path, dtype=tf.float32):
         n_input = topology[0]
         # Layers in network.
         L = len(topology) - 1
         self.session = session
         self.L = L
         self.topology = topology
-        self.o_n = tf.placeholder(dtype,shape=[None, n_input])
+        self.checkpoint_base_path = checkpoint_base_path
+        self.o_n = tf.placeholder(dtype,shape=[None, n_input], name='prog_nn_input_placeholder')
 
         self.W = []
         self.b =[]
@@ -45,13 +60,22 @@ class InitialColumnProgNN(object):
         params = []
         for k in range(L):
             shape = topology[k:k+2]
-            self.W.append(weight_variable(shape))
-            self.b.append(bias_variable([shape[1]]))
+            self.W.append(weight_variable(shape, name="weight_var_layer_"+str(k)))
+            self.b.append(bias_variable([shape[1]], name="bias_var_layer_"+str(k)))
             self.h.append(activations[k](tf.matmul(self.h[-1], self.W[k]) + self.b[k]))
             params.append(self.W[-1])
             params.append(self.b[-1])
         self.pc = ParamCollection(self.session, params)
 
+    def save(self, checkpoint_i):
+        save_path = get_checkpoint_path(self.checkpoint_base_path, 0, checkpoint_i)
+        current_params = self.pc.get_values_flat()
+        np.save(save_path, current_params)
+
+    def restore_weights(self, checkpoint_i):
+        save_path = get_checkpoint_path(self.checkpoint_base_path, 0, checkpoint_i)
+        saved_theta = np.load(save_path)
+        self.pc.set_values_flat(saved_theta)
 
 class ExtensibleColumnProgNN(object):
     """
@@ -68,7 +92,7 @@ class ExtensibleColumnProgNN(object):
         None - attaches objects to class for ExtensibleColumnProgNN.session.run()
     """
 
-    def __init__(self, topology, activations, session, prev_columns, dtype=tf.float64):
+    def __init__(self, topology, activations, session, checkpoint_base_path, prev_columns, dtype=tf.float32):
         n_input = topology[0]
         self.topology = topology
         self.session = session
@@ -77,11 +101,13 @@ class ExtensibleColumnProgNN(object):
         L = len(topology) -1
         self.L = L
         self.prev_columns = prev_columns
+        self.checkpoint_base_path = checkpoint_base_path
+        self.column_number = width
 
         # Doesn't work if the columns aren't the same height.
         assert all([self.L == x.L for x in prev_columns])
 
-        self.o_n = tf.placeholder(dtype, shape=[None, n_input])
+        self.o_n = tf.placeholder(dtype, shape=[None, n_input], name='prog_nn_input_placeholder')
 
         self.W = [[]] * L
         self.b = [[]] * L
@@ -93,8 +119,8 @@ class ExtensibleColumnProgNN(object):
         params = []
         for k in range(L):
             W_shape = topology[k:k+2]
-            self.W[k] = weight_variable(W_shape)
-            self.b[k] = bias_variable([W_shape[1]])
+            self.W[k] = weight_variable(W_shape, name="weight_var_layer_"+str(k))
+            self.b[k] = bias_variable([W_shape[1]], name="bias_var_layer_"+str(k))
             if k == 0:
                 self.h.append(activations[k](tf.matmul(self.h[-1],self.W[k]) + self.b[k]))
                 params.append(self.W[k])
@@ -104,7 +130,7 @@ class ExtensibleColumnProgNN(object):
             for kk in range(width):
                 U_shape = [prev_columns[kk].topology[k], topology[k+1]]
                 # Remember len(self.U) == L - 1!
-                self.U[k-1][kk] = weight_variable(U_shape)
+                self.U[k-1][kk] = weight_variable(U_shape, name="lateral_weight_var_layer_"+str(k)+"_to_column_"+str(kk))
                 # pprint(prev_columns[kk].h[k].get_shape().as_list())
                 # pprint(self.U[k-1][kk].get_shape().as_list())
                 preactivation +=  tf.matmul(prev_columns[kk].h[k],self.U[k-1][kk])
@@ -116,6 +142,15 @@ class ExtensibleColumnProgNN(object):
 
         self.pc = ParamCollection(self.session, params)
 
+    def save(self, checkpoint_i):
+        save_path = get_checkpoint_path(self.checkpoint_base_path, self.column_number, checkpoint_i)
+        current_params = self.pc.get_values_flat()
+        np.save(save_path, current_params)
+
+    def restore_weights(self, checkpoint_i):
+        save_path = get_checkpoint_path(self.checkpoint_base_path, self.column_number, checkpoint_i)
+        saved_theta = np.load(save_path)
+        self.pc.set_values_flat(saved_theta)
 
 def test_ProgNN():
     # Make some fake observations.
@@ -150,8 +185,13 @@ def test_ProgNN():
     # arbitrarily large number of columns / models.
 
     # Fake train the first network. h_0[-1] has information loss functions need.
+    print("by fake train")
+    print(col_0.h[-1])
     h_0 = col_0.session.run([col_0.h],
         feed_dict={col_0.o_n:fake1})
+    # print(h_0[-1])
+    print(col_0.pc.params)
+
 
     # Fake train the second network, but this time with lateral connections to
     # fake pre-trained, constant weights from first column of Progressive NN.
